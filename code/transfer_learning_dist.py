@@ -18,13 +18,25 @@ import tarfile
 import boto3
 import tensorflow as tf
 from constants import constants
-
- 
+import time
+import numpy as np 
+from sklearn.metrics import classification_report, confusion_matrix
 
 root = logging.getLogger()
 root.setLevel(logging.INFO)
 handler = logging.StreamHandler(sys.stdout)
 root.addHandler(handler)
+
+import smdistributed.dataparallel.tensorflow as dist
+
+dist.init()
+
+gpus = tf.config.experimental.list_physical_devices('GPU')
+for gpu in gpus:
+    tf.config.experimental.set_memory_growth(gpu, True)
+if gpus:
+    # SMDataParallel: Pin GPUs to a single SMDataParallel process [use SMDataParallel local_rank() API]
+    tf.config.experimental.set_visible_devices(gpus[dist.local_rank()], 'GPU')
 
 
 def download_from_s3(bucket, key, local_rel_dir, model_name):
@@ -34,14 +46,22 @@ def download_from_s3(bucket, key, local_rel_dir, model_name):
 
 
 def prepare_model(model_artifact_bucket, model_artifact_key, num_labels):
-    download_from_s3(
-        bucket=model_artifact_bucket,
-        key=model_artifact_key,
-        local_rel_dir=".",
-        model_name=constants.DOWNLOADED_MODEL_NAME,
-    )
-    with tarfile.open(constants.DOWNLOADED_MODEL_NAME) as saved_model_tar:
-        saved_model_tar.extractall(constants.DOWNLOADED_MODEL_NAME.replace(".tar.gz", ""))
+    if dist.local_rank() == 0:
+        download_from_s3(
+            bucket=model_artifact_bucket,
+            key=model_artifact_key,
+            local_rel_dir=".",
+            model_name=constants.DOWNLOADED_MODEL_NAME,
+        )
+        with tarfile.open(constants.DOWNLOADED_MODEL_NAME) as saved_model_tar:
+            saved_model_tar.extractall(constants.DOWNLOADED_MODEL_NAME.replace(".tar.gz", ""))
+    else: 
+        while True: 
+            if os.path.exists(constants.DOWNLOADED_MODEL_NAME.replace(".tar.gz", "/" + constants.VERSION)): 
+                break
+            else: 
+                time.sleep(10)
+        
     feature_extractor_layer = tf.keras.models.load_model(
         constants.DOWNLOADED_MODEL_NAME.replace(".tar.gz", "/" + constants.VERSION)
     )
@@ -63,11 +83,11 @@ def prepare_model(model_artifact_bucket, model_artifact_key, num_labels):
 
 def prepare_data(data_dir, batch_size):
     dataflow_kwargs = dict(
-        target_size=constants.IMAGE_SIZE, batch_size=batch_size, interpolation=constants.INTERPOLATION
+        target_size=constants.IMAGE_SIZE, batch_size=batch_size, interpolation=constants.INTERPOLATION, 
     )
     valid_datagen = tf.keras.preprocessing.image.ImageDataGenerator(**constants.DATA_GENERATOR_KWARGS)
     valid_generator = valid_datagen.flow_from_directory(data_dir, subset="validation", shuffle=False, **dataflow_kwargs)
-    train_datagen = valid_datagen
+    train_datagen = tf.keras.preprocessing.image.ImageDataGenerator(**constants.TRAIN_DATA_GENERATOR_KWARGS)
     train_generator = train_datagen.flow_from_directory(data_dir, subset="training", shuffle=True, **dataflow_kwargs)
 
     return train_generator, valid_generator
@@ -91,6 +111,28 @@ def _parse_args():
 
     return parser.parse_known_args()
 
+@tf.function
+def training_step(model, loss, opt, images, labels, first_batch):
+    with tf.GradientTape() as tape:
+        probs = model(images, training=True)
+        loss_value = loss(labels, probs)
+
+    # SMDataParallel: Wrap tf.GradientTape with SMDataParallel's DistributedGradientTape
+    tape = dist.DistributedGradientTape(tape)
+
+    grads = tape.gradient(loss_value, model.trainable_variables)
+    opt.apply_gradients(zip(grads, model.trainable_variables))
+
+    if first_batch:
+       # SMDataParallel: Broadcast model and optimizer variables
+        dist.broadcast_variables(model.variables, root_rank=0)
+        dist.broadcast_variables(opt.variables(), root_rank=0)
+    
+    # SMDataParallel: all_reduce call
+    loss_value = dist.oob_allreduce(loss_value) # Average the loss across workers
+    return loss_value
+
+
 
 def run_with_args(args):
     train_generator, valid_generator = prepare_data(data_dir=args.train, batch_size=args.batch_size)
@@ -102,30 +144,45 @@ def run_with_args(args):
         num_labels=train_generator.num_classes,
     )
     model.summary()
-
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(args.adam_learning_rate),
-        loss=tf.keras.losses.CategoricalCrossentropy(
+    optimizer=tf.keras.optimizers.Adam(args.adam_learning_rate*dist.size())
+    loss=tf.keras.losses.CategoricalCrossentropy(
             from_logits=constants.FROM_LOGITS, label_smoothing=constants.LABEL_SMOOTHING
-        ),
+    )
+    model.compile(
+        optimizer=optimizer,
+        loss=loss,
         metrics=["accuracy"],
     )
+    
 
     steps_per_epoch = train_generator.samples // train_generator.batch_size
-    validation_steps = valid_generator.samples // valid_generator.batch_size
-    model.fit(
-        train_generator,
-        epochs=args.epochs,
-        steps_per_epoch=steps_per_epoch,
-        validation_data=valid_generator,
-        validation_steps=validation_steps,
-        verbose=constants.VERBOSE_ONE_LINE_PER_EPOCH,
-    )
+    steps_per_evaluate = valid_generator.samples // train_generator.batch_size
+    print('total', train_generator.samples )
+    print('batch', train_generator.batch_size)
+    batch = 0 
 
-    # Training can be run on multiple hosts, but we only want the
-    # first host (since there must be at least one host) to
-    # serialize the model.
-    if args.current_host == args.hosts[0]:
+    while batch < steps_per_epoch*args.epochs: 
+        info = train_generator.next()
+        images = info[0]
+        print(images.shape)
+        labels = info[1]
+        print(labels.shape)
+        batch +=1 
+        loss_value = training_step(model, loss, optimizer, images, labels, batch == 0)
+
+        if batch % 50 == 0 :
+            print('Step #%d\tLoss: %.6f' % (batch, loss_value))
+            Y_pred = model.predict_generator(valid_generator, steps_per_evaluate+1)
+            y_pred = np.argmax(Y_pred, axis=1)
+            print('Confusion Matrix')
+            print(confusion_matrix(valid_generator.classes, y_pred))
+            target_names=[ 'False', 'True']
+            print(classification_report(valid_generator.classes, y_pred, target_names=target_names))
+            
+
+    
+
+    if  dist.rank() == 0:
         model_uncompiled = prepare_model(
             model_artifact_bucket=args.model_artifact_bucket,
             model_artifact_key=args.model_artifact_key,

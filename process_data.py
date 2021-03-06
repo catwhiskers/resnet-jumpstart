@@ -7,7 +7,7 @@ import tarfile
 
 import boto3
 # import tensorflow as tf
-from constants import constants
+
 from shutil import copyfile
 import shutil
 
@@ -35,7 +35,8 @@ def process(args):
     os.mkdir(dest_dir)
     root_dir = args.root_dir
     train_val = ['training', 'validation']
-    categories = list(range(0, 6))
+#     categories = list(range(0, 6))
+    categories = [4]
     sub_categories = ['True', 'False']
     for t in train_val: 
         for c in categories: 
@@ -50,7 +51,7 @@ def process(args):
                     if not os.path.exists(dest_sub_folder):
                         os.mkdir(dest_sub_folder)
 
-                    for f in f_arr[0:200]: 
+                    for f in f_arr: 
                         copyfile(os.path.join(origin_folder, f), os.path.join(dest_sub_folder, f))
                     
 

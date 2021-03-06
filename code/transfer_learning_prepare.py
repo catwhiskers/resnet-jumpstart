@@ -18,13 +18,16 @@ import tarfile
 import boto3
 import tensorflow as tf
 from constants import constants
+import time
+import numpy as np
+from sklearn.metrics import classification_report, confusion_matrix
 
- 
 
 root = logging.getLogger()
 root.setLevel(logging.INFO)
 handler = logging.StreamHandler(sys.stdout)
 root.addHandler(handler)
+
 
 
 def download_from_s3(bucket, key, local_rel_dir, model_name):
@@ -34,6 +37,7 @@ def download_from_s3(bucket, key, local_rel_dir, model_name):
 
 
 def prepare_model(model_artifact_bucket, model_artifact_key, num_labels):
+
     download_from_s3(
         bucket=model_artifact_bucket,
         key=model_artifact_key,
@@ -42,6 +46,8 @@ def prepare_model(model_artifact_bucket, model_artifact_key, num_labels):
     )
     with tarfile.open(constants.DOWNLOADED_MODEL_NAME) as saved_model_tar:
         saved_model_tar.extractall(constants.DOWNLOADED_MODEL_NAME.replace(".tar.gz", ""))
+
+        
     feature_extractor_layer = tf.keras.models.load_model(
         constants.DOWNLOADED_MODEL_NAME.replace(".tar.gz", "/" + constants.VERSION)
     )
@@ -63,11 +69,11 @@ def prepare_model(model_artifact_bucket, model_artifact_key, num_labels):
 
 def prepare_data(data_dir, batch_size):
     dataflow_kwargs = dict(
-        target_size=constants.IMAGE_SIZE, batch_size=batch_size, interpolation=constants.INTERPOLATION
+        target_size=constants.IMAGE_SIZE, batch_size=batch_size, interpolation=constants.INTERPOLATION, 
     )
     valid_datagen = tf.keras.preprocessing.image.ImageDataGenerator(**constants.DATA_GENERATOR_KWARGS)
     valid_generator = valid_datagen.flow_from_directory(data_dir, subset="validation", shuffle=False, **dataflow_kwargs)
-    train_datagen = valid_datagen
+    train_datagen = tf.keras.preprocessing.image.ImageDataGenerator(**constants.TRAIN_DATA_GENERATOR_KWARGS)
     train_generator = train_datagen.flow_from_directory(data_dir, subset="training", shuffle=True, **dataflow_kwargs)
 
     return train_generator, valid_generator
@@ -81,8 +87,8 @@ def _parse_args():
     # default bucket.
     parser.add_argument("--model-dir", type=str, default=os.environ.get("SM_MODEL_DIR"))
     parser.add_argument("--train", type=str, default=os.environ.get("SM_CHANNEL_TRAINING"))
-    parser.add_argument("--hosts", type=list, default=json.loads(os.environ.get("SM_HOSTS")))
-    parser.add_argument("--current-host", type=str, default=os.environ.get("SM_CURRENT_HOST"))
+#     parser.add_argument("--hosts", type=list, default=json.loads(os.environ.get("SM_HOSTS")))
+#     parser.add_argument("--current-host", type=str, default=os.environ.get("SM_CURRENT_HOST"))
     parser.add_argument("--model-artifact-bucket", type=str)
     parser.add_argument("--model-artifact-key", type=str)
     parser.add_argument("--epochs", type=int, default=5)
@@ -90,6 +96,30 @@ def _parse_args():
     parser.add_argument("--adam-learning-rate", type=float, default=0.001)
 
     return parser.parse_known_args()
+
+@tf.function
+def training_step(model, loss, opt, images, labels, first_batch):
+    with tf.GradientTape() as tape:
+        probs = model(images, training=True)
+#         print(probs.shape)
+#         print(labels[1])
+        loss_value = loss(labels, probs)
+
+    # SMDataParallel: Wrap tf.GradientTape with SMDataParallel's DistributedGradientTape
+#     tape = dist.DistributedGradientTape(tape)
+
+    grads = tape.gradient(loss_value, model.trainable_variables)
+    opt.apply_gradients(zip(grads, model.trainable_variables))
+
+#     if first_batch:
+#        # SMDataParallel: Broadcast model and optimizer variables
+#        dist.broadcast_variables(model.variables, root_rank=0)
+#        dist.broadcast_variables(opt.variables(), root_rank=0)
+    
+    # SMDataParallel: all_reduce call
+#     loss_value = dist.oob_allreduce(loss_value) # Average the loss across workers
+    return loss_value
+
 
 
 def run_with_args(args):
@@ -102,30 +132,79 @@ def run_with_args(args):
         num_labels=train_generator.num_classes,
     )
     model.summary()
-
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(args.adam_learning_rate),
-        loss=tf.keras.losses.CategoricalCrossentropy(
+    optimizer=tf.keras.optimizers.Adam(args.adam_learning_rate)
+    loss=tf.keras.losses.CategoricalCrossentropy(
             from_logits=constants.FROM_LOGITS, label_smoothing=constants.LABEL_SMOOTHING
-        ),
+    )
+    model.compile(
+        optimizer=optimizer,
+        loss=loss,
         metrics=["accuracy"],
     )
+    
+
 
     steps_per_epoch = train_generator.samples // train_generator.batch_size
-    validation_steps = valid_generator.samples // valid_generator.batch_size
-    model.fit(
-        train_generator,
-        epochs=args.epochs,
-        steps_per_epoch=steps_per_epoch,
-        validation_data=valid_generator,
-        validation_steps=validation_steps,
-        verbose=constants.VERBOSE_ONE_LINE_PER_EPOCH,
-    )
+    steps_per_evaluate = valid_generator.samples // train_generator.batch_size
+    print('total', train_generator.samples )
+    print('batch', train_generator.batch_size)
+    batch = 0 
+
+    while batch < steps_per_epoch*args.epochs: 
+        info = train_generator.next()
+        images = info[0]
+        print(images.shape)
+        labels = info[1]
+        print(labels.shape)
+        batch +=1 
+        loss_value = training_step(model, loss, optimizer, images, labels, batch == 0)
+
+        if batch % 50 == 0 :
+            print('Step #%d\tLoss: %.6f' % (batch, loss_value))
+            eb = 0 
+#             test_loss = [] 
+#             test_acc = [] 
+#             total_labels = [] 
+#             total_preds = [] 
+            Y_pred = model.predict_generator(valid_generator, steps_per_evaluate+1)
+            y_pred = np.argmax(Y_pred, axis=1)
+            print('Confusion Matrix')
+            print(confusion_matrix(valid_generator.classes, y_pred))
+#             target_names=['0-True', '1-False', '1-True', '2-False', '2-True', '3-False', '3-True', '4-False', '4-True', '5-False', '5-True']
+            target_names=[ 'False', 'True']
+            print(classification_report(valid_generator.classes, y_pred, target_names=target_names))
+
+#             while eb < steps_per_evaluate: 
+#                 test_info = valid_generator.next()
+#                 test_images = test_info[0]
+#                 test_labels = test_info[1]
+#                 total_labels += test_labels
+#                 total_preds += test_labels
+#                 results = model.evaluate(test_images, test_labels, batch_size=128)
+#                 test_loss.append(results[0])
+#                 test_acc.append(results[1])
+#                 eb += 1 
+#             print("test loss, test acc:", sum(test_loss)/len(test_loss),sum(test_acc)/len(test_acc))
+            
+        
+
+
+
+    
+#     model.fit(
+#         train_generator,
+#         epochs=args.epochs,
+#         steps_per_epoch=steps_per_epoch,
+#         validation_data=valid_generator,
+#         validation_steps=validation_steps,
+#         verbose=constants.VERBOSE_ONE_LINE_PER_EPOCH,
+#     )
 
     # Training can be run on multiple hosts, but we only want the
     # first host (since there must be at least one host) to
     # serialize the model.
-    if args.current_host == args.hosts[0]:
+    if True:
+#     if  dist.rank() == 0:
         model_uncompiled = prepare_model(
             model_artifact_bucket=args.model_artifact_bucket,
             model_artifact_key=args.model_artifact_key,
