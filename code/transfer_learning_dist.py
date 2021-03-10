@@ -85,8 +85,11 @@ def prepare_data(data_dir, batch_size):
     dataflow_kwargs = dict(
         target_size=constants.IMAGE_SIZE, batch_size=batch_size, interpolation=constants.INTERPOLATION, 
     )
+    val_dataflow_kwargs = dict(
+        target_size=constants.IMAGE_SIZE, batch_size=128, interpolation=constants.INTERPOLATION, 
+    )
     valid_datagen = tf.keras.preprocessing.image.ImageDataGenerator(**constants.DATA_GENERATOR_KWARGS)
-    valid_generator = valid_datagen.flow_from_directory(data_dir, subset="validation", shuffle=False, **dataflow_kwargs)
+    valid_generator = valid_datagen.flow_from_directory(data_dir, subset="validation", shuffle=False, **val_dataflow_kwargs)
     train_datagen = tf.keras.preprocessing.image.ImageDataGenerator(**constants.TRAIN_DATA_GENERATOR_KWARGS)
     train_generator = train_datagen.flow_from_directory(data_dir, subset="training", shuffle=True, **dataflow_kwargs)
 
@@ -132,6 +135,12 @@ def training_step(model, loss, opt, images, labels, first_batch):
     loss_value = dist.oob_allreduce(loss_value) # Average the loss across workers
     return loss_value
 
+def fulfilled(cm, threshold=0.8): 
+    c1_p = cm[:,0][0] / np.sum(cm[:,0])
+    c1_r = cm[0][0] / np.sum(cm[0])
+    c2_p = cm[:,1][1] / np.sum(cm[:,1])
+    c2_r = cm[1][1] / np.sum(cm[1])
+    return c1_p >= threshold and c1_r >= threshold and c2_p >= threshold and c2_r >= threshold
 
 
 def run_with_args(args):
@@ -156,26 +165,32 @@ def run_with_args(args):
     
 
     steps_per_epoch = train_generator.samples // train_generator.batch_size
-    steps_per_evaluate = valid_generator.samples // train_generator.batch_size
+    steps_per_evaluate = valid_generator.samples // valid_generator.batch_size
     print('total', train_generator.samples )
     print('batch', train_generator.batch_size)
     batch = 0 
-
-    while batch < steps_per_epoch*args.epochs: 
+    need_train = tf.Variable(1)
+    print(need_train.numpy())
+    while batch < (steps_per_epoch*args.epochs)//dist.size() and need_train.numpy()==1: 
         info = train_generator.next()
         images = info[0]
-        print(images.shape)
         labels = info[1]
-        print(labels.shape)
-        batch +=1 
+        
         loss_value = training_step(model, loss, optimizer, images, labels, batch == 0)
-
-        if batch % 50 == 0 :
+        batch +=1 
+        if batch % 50 == 0 and dist.rank() == 0:
             print('Step #%d\tLoss: %.6f' % (batch, loss_value))
             Y_pred = model.predict_generator(valid_generator, steps_per_evaluate+1)
+            print(Y_pred)
             y_pred = np.argmax(Y_pred, axis=1)
             print('Confusion Matrix')
             print(confusion_matrix(valid_generator.classes, y_pred))
+            cm = confusion_matrix(valid_generator.classes, y_pred)
+#             if fulfilled(cm): 
+#                 need_train.assign(0)
+#                 dist.broadcast(need_train,dist.rank())
+#                 break
+#             print(c1_p, c1_r, c2_p, c2_r)
             target_names=[ 'False', 'True']
             print(classification_report(valid_generator.classes, y_pred, target_names=target_names))
             
@@ -202,7 +217,9 @@ def run_with_args(args):
         # saving class_label_to_prediction_index in model_dir
         with open(os.path.join(args.model_dir, constants.CLASS_LABEL_TO_PREDICTION_INDEX_JSON), "w") as jsonFile:
             json.dump(train_generator.class_indices, jsonFile)
-
+        print("dist shutdown")
+        dist.shutdown()
+            
 
 if __name__ == "__main__":
     args, unknown = _parse_args()

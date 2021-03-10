@@ -87,8 +87,6 @@ def _parse_args():
     # default bucket.
     parser.add_argument("--model-dir", type=str, default=os.environ.get("SM_MODEL_DIR"))
     parser.add_argument("--train", type=str, default=os.environ.get("SM_CHANNEL_TRAINING"))
-#     parser.add_argument("--hosts", type=list, default=json.loads(os.environ.get("SM_HOSTS")))
-#     parser.add_argument("--current-host", type=str, default=os.environ.get("SM_CURRENT_HOST"))
     parser.add_argument("--model-artifact-bucket", type=str)
     parser.add_argument("--model-artifact-key", type=str)
     parser.add_argument("--epochs", type=int, default=5)
@@ -101,26 +99,18 @@ def _parse_args():
 def training_step(model, loss, opt, images, labels, first_batch):
     with tf.GradientTape() as tape:
         probs = model(images, training=True)
-#         print(probs.shape)
-#         print(labels[1])
         loss_value = loss(labels, probs)
-
-    # SMDataParallel: Wrap tf.GradientTape with SMDataParallel's DistributedGradientTape
-#     tape = dist.DistributedGradientTape(tape)
 
     grads = tape.gradient(loss_value, model.trainable_variables)
     opt.apply_gradients(zip(grads, model.trainable_variables))
-
-#     if first_batch:
-#        # SMDataParallel: Broadcast model and optimizer variables
-#        dist.broadcast_variables(model.variables, root_rank=0)
-#        dist.broadcast_variables(opt.variables(), root_rank=0)
-    
-    # SMDataParallel: all_reduce call
-#     loss_value = dist.oob_allreduce(loss_value) # Average the loss across workers
     return loss_value
 
-
+def fulfilled(cm, threshold=0.9): 
+    c1_p = cm[:,0][0] / np.sum(cm[:,0])
+    c1_r = cm[0][0] / np.sum(cm[0])
+    c2_p = cm[:,1][1] / np.sum(cm[:,1])
+    c2_r = cm[1][1] / np.sum(cm[1])
+    return c1_p >= threshold and c1_r >= threshold and c2_p >= threshold and c2_r >= threshold
 
 def run_with_args(args):
     train_generator, valid_generator = prepare_data(data_dir=args.train, batch_size=args.batch_size)
@@ -141,89 +131,52 @@ def run_with_args(args):
         loss=loss,
         metrics=["accuracy"],
     )
-    
-
-
+   
     steps_per_epoch = train_generator.samples // train_generator.batch_size
     steps_per_evaluate = valid_generator.samples // train_generator.batch_size
     print('total', train_generator.samples )
     print('batch', train_generator.batch_size)
     batch = 0 
-
     while batch < steps_per_epoch*args.epochs: 
         info = train_generator.next()
         images = info[0]
-        print(images.shape)
         labels = info[1]
-        print(labels.shape)
         batch +=1 
         loss_value = training_step(model, loss, optimizer, images, labels, batch == 0)
 
         if batch % 50 == 0 :
             print('Step #%d\tLoss: %.6f' % (batch, loss_value))
-            eb = 0 
-#             test_loss = [] 
-#             test_acc = [] 
-#             total_labels = [] 
-#             total_preds = [] 
             Y_pred = model.predict_generator(valid_generator, steps_per_evaluate+1)
             y_pred = np.argmax(Y_pred, axis=1)
             print('Confusion Matrix')
             print(confusion_matrix(valid_generator.classes, y_pred))
-#             target_names=['0-True', '1-False', '1-True', '2-False', '2-True', '3-False', '3-True', '4-False', '4-True', '5-False', '5-True']
+            cm = confusion_matrix(valid_generator.classes, y_pred)
+            if fulfilled(cm): 
+                break
+#             print(c1_p, c1_r, c2_p, c2_r)
             target_names=[ 'False', 'True']
             print(classification_report(valid_generator.classes, y_pred, target_names=target_names))
 
-#             while eb < steps_per_evaluate: 
-#                 test_info = valid_generator.next()
-#                 test_images = test_info[0]
-#                 test_labels = test_info[1]
-#                 total_labels += test_labels
-#                 total_preds += test_labels
-#                 results = model.evaluate(test_images, test_labels, batch_size=128)
-#                 test_loss.append(results[0])
-#                 test_acc.append(results[1])
-#                 eb += 1 
-#             print("test loss, test acc:", sum(test_loss)/len(test_loss),sum(test_acc)/len(test_acc))
-            
-        
-
-
-
     
-#     model.fit(
-#         train_generator,
-#         epochs=args.epochs,
-#         steps_per_epoch=steps_per_epoch,
-#         validation_data=valid_generator,
-#         validation_steps=validation_steps,
-#         verbose=constants.VERBOSE_ONE_LINE_PER_EPOCH,
-#     )
-
-    # Training can be run on multiple hosts, but we only want the
-    # first host (since there must be at least one host) to
-    # serialize the model.
-    if True:
-#     if  dist.rank() == 0:
-        model_uncompiled = prepare_model(
-            model_artifact_bucket=args.model_artifact_bucket,
-            model_artifact_key=args.model_artifact_key,
-            num_labels=train_generator.num_classes,
-        )
-        model_uncompiled.set_weights(model.get_weights())
-        export_path = os.path.join(args.model_dir, constants.VERSION)
-        tf.keras.models.save_model(
-            model_uncompiled,
-            export_path,
-            overwrite=True,
-            include_optimizer=False,
-            save_format=None,
-            signatures=None,
-            options=None,
-        )
+    model_uncompiled = prepare_model(
+        model_artifact_bucket=args.model_artifact_bucket,
+        model_artifact_key=args.model_artifact_key,
+        num_labels=train_generator.num_classes,
+    )
+    model_uncompiled.set_weights(model.get_weights())
+    export_path = os.path.join(args.model_dir, constants.VERSION)
+    tf.keras.models.save_model(
+        model_uncompiled,
+        export_path,
+        overwrite=True,
+        include_optimizer=False,
+        save_format=None,
+        signatures=None,
+        options=None,
+    )
         # saving class_label_to_prediction_index in model_dir
-        with open(os.path.join(args.model_dir, constants.CLASS_LABEL_TO_PREDICTION_INDEX_JSON), "w") as jsonFile:
-            json.dump(train_generator.class_indices, jsonFile)
+    with open(os.path.join(args.model_dir, constants.CLASS_LABEL_TO_PREDICTION_INDEX_JSON), "w") as jsonFile:
+        json.dump(train_generator.class_indices, jsonFile)
 
 
 if __name__ == "__main__":
